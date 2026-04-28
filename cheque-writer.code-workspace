@@ -1,0 +1,10 @@
+{
+  "folders": [
+    { "name": "Cheque Writer Module", "path": "." },
+    { "name": "Next Web", "path": "apps/web" },
+    { "name": "CSharp ERP API", "path": "services/erp-integration-api" }
+  ],
+  "settings": {
+    "editor.formatOnSave": true
+  }
+}
