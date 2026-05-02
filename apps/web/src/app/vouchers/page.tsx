@@ -6,7 +6,20 @@ import { formatMoney } from "@/lib/money";
 import { amountToWords } from "@/lib/amount-to-words";
 import type { Voucher } from "@/lib/types";
 
-type Payload = { success: boolean; data?: Voucher[]; error?: string };
+type QueueVoucher = Voucher & {
+  bankAccountSetupStatus?: string | null;
+  canPrint?: boolean | null;
+};
+
+type Payload = { success: boolean; data?: QueueVoucher[]; error?: string };
+
+function getVoucherSetupStatus(voucher: QueueVoucher): string {
+  return voucher.bankAccountSetupStatus?.trim() || "UNKNOWN";
+}
+
+function isVoucherReadyToPrint(voucher: QueueVoucher): boolean {
+  return voucher.canPrint === true && getVoucherSetupStatus(voucher) === "READY";
+}
 
 function todayIso() {
   const now = new Date();
@@ -15,8 +28,8 @@ function todayIso() {
 }
 
 export default function VouchersPage() {
-  const [vouchers, setVouchers] = useState<Voucher[]>([]);
-  const [selected, setSelected] = useState<Voucher | null>(null);
+  const [vouchers, setVouchers] = useState<QueueVoucher[]>([]);
+  const [selected, setSelected] = useState<QueueVoucher | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -71,6 +84,10 @@ export default function VouchersPage() {
 
   async function confirmPrint() {
     if (!selected) return;
+    if (!isVoucherReadyToPrint(selected)) {
+      setError(`Voucher is not ready for printing: ${getVoucherSetupStatus(selected)}`);
+      return;
+    }
     setMessage(null);
     setError(null);
     const response = await fetch("/api/cw/print", {
@@ -149,8 +166,19 @@ export default function VouchersPage() {
                   <td>{v.bankAccountCode}</td>
                   <td>{v.chequeNo}</td>
                   <td>{v.chequeDate}</td>
-                  <td><span className="badge">{v.printStatus || "READY"}</span></td>
-                  <td><button className="btn" onClick={() => setSelected(v)}>Preview / Print</button></td>
+                  <td>
+                    <span className="badge">{getVoucherSetupStatus(v)}</span>
+                  </td>
+                  <td>
+                    <button
+                      className="btn"
+                      onClick={() => setSelected(v)}
+                      disabled={!isVoucherReadyToPrint(v)}
+                      title={isVoucherReadyToPrint(v) ? "Preview / Print" : getVoucherSetupStatus(v)}
+                    >
+                      Preview / Print
+                    </button>
+                  </td>
                 </tr>
               ))}
               {filteredVouchers.length === 0 ? (

@@ -1,5 +1,6 @@
 import Link from "next/link";
-import { BookOpen, FileText, LayoutDashboard, LogOut, Printer, Settings } from "lucide-react";
+import { BookOpen, FileText, LayoutDashboard, Printer, Settings } from "lucide-react";
+import LogoutButton from "@/components/logout-button";
 
 const nav = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
@@ -25,10 +26,7 @@ export default function AppShell({ title, description, children }: { title: stri
               </Link>
             );
           })}
-          <Link href="/login">
-            <LogOut size={18} />
-            <span>Login</span>
-          </Link>
+          <LogoutButton />
         </nav>
       </aside>
       <main className="main">

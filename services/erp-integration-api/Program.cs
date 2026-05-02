@@ -6,6 +6,7 @@ using Dapper;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Data.SqlClient;
 using Microsoft.IdentityModel.Tokens;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -154,12 +155,57 @@ secured.MapPut("/layouts/{layoutId:int}", async (int layoutId, ClaimsPrincipal u
     }
 });
 
+secured.MapPut("/cheque-books/{chequeBookId:int}", async (
+    int chequeBookId,
+    ClaimsPrincipal user,
+    ChequeBookCreateRequest request,
+    ChequeWriterService service) =>
+{
+    try
+    {
+        var result = await service.UpdateChequeBookAsync(user, chequeBookId, request);
+        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+    }
+    catch (Exception ex)
+    {
+        return ServerError(ex);
+    }
+});
+
 secured.MapPost("/print-confirmations", async (ClaimsPrincipal user, PrintConfirmationRequest request, ChequeWriterService service) =>
 {
     try
     {
         var result = await service.ConfirmPrintAsync(user, request);
         return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+    }
+    catch (Exception ex)
+    {
+        return ServerError(ex);
+    }
+});
+
+secured.MapPost("/bank-accounts/refresh", async (ClaimsPrincipal user, ChequeWriterService service) =>
+{
+    try
+    {
+        var result = await service.RefreshBankAccountMasterAsync(user);
+        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+    }
+    catch (Exception ex)
+    {
+        return ServerError(ex);
+    }
+});
+
+secured.MapGet("/bank-accounts", async (ChequeWriterService service, bool availableForLayout = false, int? layoutId = null) =>
+{
+    try
+    {
+        var rows = availableForLayout
+            ? await service.GetBankAccountsAvailableForLayoutAsync(layoutId)
+            : await service.GetActiveBankAccountsAsync();
+        return Results.Ok(new { success = true, data = rows });
     }
     catch (Exception ex)
     {
@@ -238,8 +284,9 @@ public sealed class AuthService(IConfiguration configuration, DbConnectionFactor
 public sealed class ChequeWriterService(IConfiguration configuration, DbConnectionFactory dbFactory)
 {
     private static readonly List<ChequeLayoutDto> DemoLayouts = [ChequeLayoutDto.Demo()];
-
-    public async Task<IReadOnlyList<VoucherDto>> GetPendingVouchersAsync(ClaimsPrincipal user, string? bankAccountCode, DateTime? fromDate, DateTime? toDate, int? maxRows)
+/*
+    public async Task<IReadOnlyList<VoucherDto>> GetPendingVouchersAsync(
+        ClaimsPrincipal user, string? bankAccountCode, DateTime? fromDate, DateTime? toDate, int? maxRows)
     {
         if (configuration.GetValue<bool>("ChequeWriter:DemoMode")) return [VoucherDto.Demo()];
 
@@ -263,6 +310,49 @@ public sealed class ChequeWriterService(IConfiguration configuration, DbConnecti
 
         return rows.Select(NormalizeVoucher).Take(effectiveMaxRows).ToList();
     }
+  */
+  private static string VoucherStatusKey(string? voucherNo, string? bankAccountCode, string? chequeNo)
+{
+    return string.Join("|",
+        (voucherNo ?? "").Trim(),
+        (bankAccountCode ?? "").Trim(),
+        (chequeNo ?? "").Trim()).ToUpperInvariant();
+}
+
+private async Task<Dictionary<string, BankAccountSetupStatusDto>> GetVoucherQueueSetupStatusAsync(
+    IDbConnection db,
+    IEnumerable<VoucherDto> vouchers,
+    IDbTransaction? tx = null)
+{
+    var items = vouchers
+        .Where(x => !string.IsNullOrWhiteSpace(x.BankAccountCode))
+        .Select(x => new
+        {
+            VoucherNo = x.VoucherNo,
+            BankAccountCode = x.BankAccountCode?.Trim(),
+            ChequeNo = x.ChequeNo?.Trim()
+        })
+        .Distinct()
+        .ToList();
+
+    if (items.Count == 0)
+    {
+        return new Dictionary<string, BankAccountSetupStatusDto>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    var json = JsonSerializer.Serialize(items);
+
+    var rows = await db.QueryAsync<BankAccountSetupStatusDto>(
+        "cw.usp_CW_GetVoucherQueueSetupStatus",
+        new { VoucherItems = json },
+        transaction: tx,
+        commandType: CommandType.StoredProcedure,
+        commandTimeout: 120);
+
+    return rows.ToDictionary(
+        x => VoucherStatusKey(x.VoucherNo, x.BankAccountCode, x.ChequeNo),
+        StringComparer.OrdinalIgnoreCase);
+}
 
     public async Task<IReadOnlyList<ChequeBookDto>> GetChequeBooksAsync()
     {
@@ -281,6 +371,19 @@ public sealed class ChequeWriterService(IConfiguration configuration, DbConnecti
         if (configuration.GetValue<bool>("ChequeWriter:DemoMode")) return ApiResult.Ok(new { request.BankAccountCode, request.StartChequeNo, request.EndChequeNo });
 
         using var db = dbFactory.Create();
+
+        await db.ExecuteAsync(
+                "cw.usp_CW_ValidateChequeBookBankAccount",
+                new
+                {
+                    request.BankAccountCode,
+                    request.StartChequeNo,
+                    request.EndChequeNo,
+                    ChequeBookId = (int?)null
+                },
+                commandType: CommandType.StoredProcedure,
+                commandTimeout: 120);
+
         var chequeBookId = await db.ExecuteScalarAsync<int>(@"
             INSERT INTO cw.ChequeBookMaster (BankAccountCode, BankAccountName, BankName, ChequeBookNo, StartChequeNo, EndChequeNo, CreatedBy)
             OUTPUT INSERTED.ChequeBookId
@@ -289,6 +392,88 @@ public sealed class ChequeWriterService(IConfiguration configuration, DbConnecti
             commandTimeout: 120);
         return ApiResult.Ok(new { chequeBookId, request.BankAccountCode });
     }
+
+public async Task<ApiResult> UpdateChequeBookAsync(
+    ClaimsPrincipal user,
+    int chequeBookId,
+    ChequeBookCreateRequest request)
+{
+    if (!HasPermission(user, "CHEQUE_WRITER.CHEQUE_BOOK_MAINTAIN"))
+    {
+        return ApiResult.Fail("No permission to maintain cheque books.");
+    }
+
+    if (chequeBookId <= 0)
+    {
+        return ApiResult.Fail("Invalid cheque book id.");
+    }
+
+    if (string.IsNullOrWhiteSpace(request.BankAccountCode))
+    {
+        return ApiResult.Fail("Bank account is required.");
+    }
+
+    if (string.IsNullOrWhiteSpace(request.StartChequeNo))
+    {
+        return ApiResult.Fail("Start cheque number is required.");
+    }
+
+    if (string.IsNullOrWhiteSpace(request.EndChequeNo))
+    {
+        return ApiResult.Fail("End cheque number is required.");
+    }
+
+    if (configuration.GetValue<bool>("ChequeWriter:DemoMode"))
+    {
+        return ApiResult.Ok(new { chequeBookId, request.BankAccountCode });
+    }
+
+    using var db = dbFactory.Create();
+
+    await db.ExecuteAsync(
+        "cw.usp_CW_ValidateChequeBookBankAccount",
+        new
+        {
+            request.BankAccountCode,
+            request.StartChequeNo,
+            request.EndChequeNo,
+            ChequeBookId = chequeBookId
+        },
+        commandType: CommandType.StoredProcedure,
+        commandTimeout: 120);
+
+    var affected = await db.ExecuteAsync(@"
+        UPDATE cw.ChequeBookMaster
+        SET
+            BankAccountCode = @BankAccountCode,
+            BankAccountName = @BankAccountName,
+            BankName = @BankName,
+            ChequeBookNo = @ChequeBookNo,
+            StartChequeNo = @StartChequeNo,
+            EndChequeNo = @EndChequeNo,
+            UpdatedBy = @UpdatedBy,
+            UpdatedDate = SYSDATETIME()
+        WHERE ChequeBookId = @ChequeBookId;",
+        new
+        {
+            ChequeBookId = chequeBookId,
+            request.BankAccountCode,
+            request.BankAccountName,
+            request.BankName,
+            request.ChequeBookNo,
+            request.StartChequeNo,
+            request.EndChequeNo,
+            UpdatedBy = user.Identity?.Name ?? "system"
+        },
+        commandTimeout: 120);
+
+    if (affected == 0)
+    {
+        return ApiResult.Fail("Cheque book was not found.");
+    }
+
+    return ApiResult.Ok(new { chequeBookId, request.BankAccountCode });
+}
 
     public async Task<IReadOnlyList<ChequeLayoutDto>> GetLayoutsAsync()
     {
@@ -333,6 +518,11 @@ public sealed class ChequeWriterService(IConfiguration configuration, DbConnecti
         }
 
         using var db = dbFactory.Create();
+        await db.ExecuteAsync(
+                    "cw.usp_CW_ValidateLayoutBankAccount",
+                    new { request.BankAccountCode, LayoutId = (int?)null },
+                    commandType: CommandType.StoredProcedure,
+                    commandTimeout: 120);
         var layoutId = await db.ExecuteScalarAsync<int>(@"
             INSERT INTO cw.BankChequeLayout
             (BankAccountCode, LayoutName, PageWidthMm, PageHeightMm, DateX, DateY, PayeeX, PayeeY, AmountNumberX, AmountNumberY, AmountWordsX, AmountWordsY, AccountPayeeX, AccountPayeeY, FontSize, IsActive, CreatedBy)
@@ -378,6 +568,11 @@ public sealed class ChequeWriterService(IConfiguration configuration, DbConnecti
         }
 
         using var db = dbFactory.Create();
+                    await db.ExecuteAsync(
+                "cw.usp_CW_ValidateLayoutBankAccount",
+                new { request.BankAccountCode, LayoutId = layoutId },
+                commandType: CommandType.StoredProcedure,
+                commandTimeout: 120);
         var affected = await db.ExecuteAsync(@"
             UPDATE cw.BankChequeLayout
             SET
@@ -450,7 +645,34 @@ public sealed class ChequeWriterService(IConfiguration configuration, DbConnecti
             if (string.IsNullOrWhiteSpace(voucher.BankAccountCode)) { tx.Rollback(); return ApiResult.Fail("Voucher has no bank account."); }
             if (string.IsNullOrWhiteSpace(voucher.ChequeNo)) { tx.Rollback(); return ApiResult.Fail("Voucher has no cheque number."); }
             if (voucher.ChequeDate is null) { tx.Rollback(); return ApiResult.Fail("Voucher has no cheque date."); }
+                var bankAccount = await db.QueryFirstOrDefaultAsync<BankAccountDto>(@"
+                    SELECT TOP 1
+                        BankAccountCode,
+                        BankAccountName,
+                        BankName,
+                        BranchCode,
+                        BranchName,
+                        CurrencyCode,
+                        CompanyCode,
+                        IsActive,
+                        LastSyncedDate
+                    FROM cw.BankAccountMaster
+                    WHERE BankAccountCode = @BankAccountCode",
+                    new { voucher.BankAccountCode },
+                    tx,
+                    commandTimeout: 120);
 
+                if (bankAccount is null)
+                {
+                    tx.Rollback();
+                    return ApiResult.Fail("Voucher bank account is not available in cheque writer bank account master. Refresh bank accounts and try again.");
+                }
+
+                if (!bankAccount.IsActive)
+                {
+                    tx.Rollback();
+                    return ApiResult.Fail("Voucher bank account is inactive in cheque writer bank account master.");
+                }
             var book = await db.QueryFirstOrDefaultAsync<ChequeBookDto>(@"
                 SELECT TOP 1 ChequeBookId, BankAccountCode, BankAccountName, BankName, ChequeBookNo, StartChequeNo, EndChequeNo, IsActive
                 FROM cw.ChequeBookMaster
@@ -501,6 +723,189 @@ public sealed class ChequeWriterService(IConfiguration configuration, DbConnecti
             throw;
         }
     }
+    
+     public async Task<ApiResult> RefreshBankAccountMasterAsync(ClaimsPrincipal user)
+     {
+            if (!HasPermission(user, "CHEQUE_WRITER.ADMIN") &&
+                !HasPermission(user, "CHEQUE_WRITER.LAYOUT_MAINTAIN") &&
+                !HasPermission(user, "CHEQUE_WRITER.CHEQUE_BOOK_MAINTAIN"))
+            {
+                return ApiResult.Fail("No permission to refresh bank account master.");
+            }
+
+            if (configuration.GetValue<bool>("ChequeWriter:DemoMode"))
+            {
+                return ApiResult.Ok(new { refreshed = true, demoMode = true });
+            }
+
+            using var db = dbFactory.Create();
+            await db.ExecuteAsync(
+                "cw.usp_CW_RefreshBankAccountMaster",
+                new { RunBy = user.Identity?.Name ?? "system" },
+                commandType: CommandType.StoredProcedure,
+                commandTimeout: 180);
+
+            return ApiResult.Ok(new { refreshed = true });
+    }
+
+    public async Task<IReadOnlyList<BankAccountDto>> GetActiveBankAccountsAsync()
+    {
+    if (configuration.GetValue<bool>("ChequeWriter:DemoMode"))
+    {
+        return [new BankAccountDto
+        {
+            BankAccountCode = "BOC-CURRENT-001",
+            BankAccountName = "BOC Current Account",
+            BankName = "Bank of Ceylon",
+            CurrencyCode = "LKR",
+            CompanyCode = "DEMO",
+            IsActive = true,
+            LastSyncedDate = DateTime.Now
+        }];
+    }
+
+    using var db = dbFactory.Create();
+    var rows = await db.QueryAsync<BankAccountDto>(
+        "cw.usp_CW_GetActiveBankAccounts",
+        commandType: CommandType.StoredProcedure,
+        commandTimeout: 120);
+    return rows.ToList();
+  }
+
+public async Task<IReadOnlyList<BankAccountDto>> GetBankAccountsAvailableForLayoutAsync(int? layoutId)
+{
+    if (configuration.GetValue<bool>("ChequeWriter:DemoMode"))
+    {
+        return await GetActiveBankAccountsAsync();
+    }
+
+    using var db = dbFactory.Create();
+    var rows = await db.QueryAsync<BankAccountDto>(
+        "cw.usp_CW_GetBankAccountsAvailableForLayout",
+        new { LayoutId = layoutId },
+        commandType: CommandType.StoredProcedure,
+        commandTimeout: 120);
+    return rows.ToList();
+}
+
+private async Task<Dictionary<string, BankAccountSetupStatusDto>> GetBankAccountSetupStatusAsync(
+    IDbConnection db,
+    IEnumerable<string?> bankAccountCodes,
+    IDbTransaction? tx = null)
+  {
+    var csv = string.Join(",", bankAccountCodes
+        .Where(x => !string.IsNullOrWhiteSpace(x))
+        .Select(x => x!.Trim())
+        .Distinct(StringComparer.OrdinalIgnoreCase));
+
+    if (string.IsNullOrWhiteSpace(csv))
+    {
+        return new Dictionary<string, BankAccountSetupStatusDto>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    var rows = await db.QueryAsync<BankAccountSetupStatusDto>(
+        "cw.usp_CW_GetVoucherBankAccountSetupStatus",
+        new { BankAccountCodes = csv },
+        transaction: tx,
+        commandType: CommandType.StoredProcedure,
+        commandTimeout: 120);
+
+    return rows.ToDictionary(x => x.BankAccountCode, StringComparer.OrdinalIgnoreCase);
+  }
+
+   public async Task<IReadOnlyList<VoucherDto>> GetPendingVouchersAsync(
+    ClaimsPrincipal user,
+    string? bankAccountCode,
+    DateTime? fromDate,
+    DateTime? toDate,
+    int? maxRows)
+        {
+            if (configuration.GetValue<bool>("ChequeWriter:DemoMode")) return [VoucherDto.Demo()];
+
+            var effectiveFromDate = fromDate ?? DateTime.Today;
+            var effectiveMaxRows = Math.Clamp(maxRows ?? 200, 1, 1000);
+
+            using var db = dbFactory.Create();
+
+            // First refresh before receiving voucher queue.
+            await db.ExecuteAsync(
+                "cw.usp_CW_RefreshBankAccountMaster",
+                new { RunBy = user.Identity?.Name ?? "system" },
+                commandType: CommandType.StoredProcedure,
+                commandTimeout: 180);
+
+            var rows = (await db.QueryAsync<VoucherDto>(
+                "cw.usp_CW_GetPendingPaymentVouchers",
+                new
+                {
+                    ErpUserId = user.FindFirstValue("erp_user_id"),
+                    CompanyCode = EmptyToNull(user.FindFirstValue("company_code")),
+                    BranchCode = EmptyToNull(user.FindFirstValue("branch_code")),
+                    BankAccountCode = EmptyToNull(bankAccountCode),
+                    FromDate = effectiveFromDate,
+                    ToDate = toDate
+                },
+                commandType: CommandType.StoredProcedure,
+                commandTimeout: 120))
+                .Select(NormalizeVoucher)
+                .Take(effectiveMaxRows)
+                .ToList();
+
+            var statusMap = await GetVoucherQueueSetupStatusAsync(db, rows);
+       //       var hasMissingBankMaster = statusMap.Values.Any(x => x.SetupStatus == "MISSING_BANK_MASTER");
+                var hasMissingBankMaster = statusMap.Values.Any(x => x.SetupStatus == "MISSING_BANK_MASTER");
+                if (hasMissingBankMaster)
+                {
+                    await db.ExecuteAsync(
+                        "cw.usp_CW_RefreshBankAccountMaster",
+                        new { RunBy = user.Identity?.Name ?? "system" },
+                        commandType: CommandType.StoredProcedure,
+                        commandTimeout: 180);
+
+                    statusMap = await GetVoucherQueueSetupStatusAsync(db, rows);
+                }
+            // Safety refresh if voucher list contains bank accounts that are still not in master.
+            if (hasMissingBankMaster)
+            {
+                await db.ExecuteAsync(
+                    "cw.usp_CW_RefreshBankAccountMaster",
+                    new { RunBy = user.Identity?.Name ?? "system" },
+                    commandType: CommandType.StoredProcedure,
+                    commandTimeout: 180);
+
+                statusMap = await GetBankAccountSetupStatusAsync(db, rows.Select(x => x.BankAccountCode));
+            }
+
+     /*       foreach (var row in rows)
+            {
+                if (statusMap.TryGetValue(row.BankAccountCode, out var status))
+                {
+                    row.BankAccountSetupStatus = status.SetupStatus;
+                    row.CanPrint = status.SetupStatus == "READY";
+                }
+                else
+                {
+                    row.BankAccountSetupStatus = "MISSING_BANK_MASTER";
+                    row.CanPrint = false;
+                }
+            } */
+             foreach (var row in rows)
+             {
+                 if (statusMap.TryGetValue(VoucherStatusKey(row.VoucherNo, row.BankAccountCode, row.ChequeNo), out var status))
+                 {
+                     row.BankAccountSetupStatus = status.SetupStatus;
+                     row.CanPrint = status.SetupStatus == "READY";
+                 }
+                 else
+                 {
+                     row.BankAccountSetupStatus = "MISSING_BANK_MASTER";
+                     row.CanPrint = false;
+                 }
+            }
+            return rows;
+        }
+
+
 
     private static VoucherDto NormalizeVoucher(VoucherDto voucher)
     {
@@ -554,6 +959,8 @@ public sealed class VoucherDto
     public string? ApprovedBy { get; set; }
     public DateTime? ApprovedDate { get; set; }
     public string? PrintStatus { get; set; } = "READY";
+    public string? BankAccountSetupStatus { get; set; } = "UNKNOWN";
+    public bool CanPrint { get; set; } = false;
 
     public static VoucherDto Demo() => new()
     {
@@ -598,6 +1005,31 @@ public sealed class ChequeBookDto
         EndChequeNo = "000199",
         IsActive = true
     };
+}
+
+public sealed class BankAccountDto
+{
+    public string BankAccountCode { get; set; } = "";
+    public string? BankAccountName { get; set; }
+    public string? BankName { get; set; }
+    public string? BranchCode { get; set; }
+    public string? BranchName { get; set; }
+    public string? CurrencyCode { get; set; }
+    public string? CompanyCode { get; set; }
+    public bool IsActive { get; set; } = true;
+    public DateTime? LastSyncedDate { get; set; }
+}
+
+public sealed class BankAccountSetupStatusDto
+{
+    public string BankAccountCode { get; set; } = "";
+    public bool ExistsInBankMaster { get; set; }
+    public bool IsActiveBankAccount { get; set; }
+    public bool HasActiveLayout { get; set; }
+    public bool HasActiveChequeBook { get; set; }
+    public string SetupStatus { get; set; } = "READY";
+    public string? VoucherNo { get; set; }
+    public string? ChequeNo { get; set; }
 }
 
 public sealed record ChequeBookCreateRequest(string BankAccountCode, string? BankAccountName, string? BankName, string? ChequeBookNo, string StartChequeNo, string EndChequeNo);
