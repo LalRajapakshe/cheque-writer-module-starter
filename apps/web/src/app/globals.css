@@ -249,26 +249,6 @@ th {
   color: #991b1b;
 }
 
-.cheque-preview {
-  position: relative;
-  width: 720px;
-  height: 360px;
-  background: #fff;
-  border: 1px dashed #94a3b8;
-  border-radius: 16px;
-  overflow: hidden;
-  margin-top: 14px;
-}
-
-.cheque-field {
-  position: absolute;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.print-only {
-  display: none;
-}
 
 @media print {
   body * {
@@ -323,4 +303,82 @@ th {
 
 .nav-button:hover {
   background: rgba(255, 255, 255, 0.08);
+}
+
+/* ===================================== */
+/* CHEQUE PRINT LAYOUT */
+/* ===================================== */
+
+.cheque-preview {
+  position: relative;
+  width: 900px;
+  height: 350px;
+  background: white;
+  overflow: hidden;
+  margin: 0 auto;
+}
+
+.cheque-field {
+  position: absolute;
+  font-size: 14px;
+  color: black;
+}
+
+/* ===================================== */
+/* PRINT SETTINGS */
+/* ===================================== */
+
+@page {
+  size: 241mm 105mm;
+  margin: 0;
+}
+
+@media print {
+
+  html,
+  body {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: white !important;
+    overflow: hidden !important;
+  }
+
+  body * {
+    visibility: hidden;
+  }
+
+  .print-area,
+  .print-area * {
+    visibility: visible;
+  }
+
+  .print-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+
+    width: fit-content;
+    margin: 0 auto;
+    padding: 0;
+
+    overflow: hidden;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .cheque-preview {
+    position: relative;
+    background: white;
+    overflow: hidden;
+    margin: 0 auto;
+
+    transform: scale(1);
+    transform-origin: top center;
+
+    page-break-after: avoid;
+    page-break-before: avoid;
+  }
+
 }

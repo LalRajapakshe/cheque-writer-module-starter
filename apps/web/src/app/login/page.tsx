@@ -29,6 +29,7 @@ export default function LoginPage() {
       const response = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        //credentials: "include", // 🔥 THIS IS THE FIX
         body: JSON.stringify({ userName, password, companyCode }),
       });
 
@@ -40,6 +41,8 @@ export default function LoginPage() {
       }
 
       setMessage("Login successful.");
+      // const nextPath = getNextPath();
+      // alert("Next Path: " + nextPath); //console.log("Next Path:", nextPath); // Log the next path
       router.replace(getNextPath());
       router.refresh();
     } catch (err) {
@@ -65,7 +68,7 @@ export default function LoginPage() {
           </label>
           <label className="field">
             <span className="label">Password</span>
-            <input className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+            <input className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
           </label>
           {message ? <div className="alert">{message}</div> : null}
           {error ? <div className="alert error">{error}</div> : null}

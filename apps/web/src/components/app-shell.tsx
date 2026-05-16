@@ -7,7 +7,7 @@ const nav = [
   { href: "/vouchers", label: "Voucher Queue", icon: FileText },
   { href: "/cheque-books", label: "Cheque Books", icon: BookOpen },
   { href: "/layouts", label: "Bank Layouts", icon: Settings },
-  { href: "/reports", label: "Reports", icon: Printer },
+  { href: "/cw/reports", label: "Reports", icon: Printer },
 ];
 
 export default function AppShell({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {

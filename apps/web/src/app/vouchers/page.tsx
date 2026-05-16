@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import AppShell from "@/components/app-shell";
 import { formatMoney } from "@/lib/money";
 import { amountToWords } from "@/lib/amount-to-words";
-import type { Voucher } from "@/lib/types";
+import type { Voucher, ChequeLayout } from "@/lib/types";
 
 type QueueVoucher = Voucher & {
   bankAccountSetupStatus?: string | null;
@@ -38,6 +38,40 @@ export default function VouchersPage() {
   const [bankAccountCode, setBankAccountCode] = useState("");
   const [search, setSearch] = useState("");
   const [maxRows, setMaxRows] = useState("200");
+
+  const [layouts, setLayouts] = useState<ChequeLayout[]>([]);
+
+  const calibrationX = 0;
+  const calibrationY = 0;
+
+  const printScale = 1;
+
+  const chequeLayout = {
+    dateLeft: 540,
+    dateTop: 56,
+
+    payeeLeft: 112,
+    payeeTop: 118,
+
+    amountLeft: 588,
+    amountTop: 182,
+
+    wordsLeft: 120,
+    wordsTop: 212,
+
+    accountPayeeLeft: 84,
+    accountPayeeTop: 74,
+  };
+
+  const selectedLayout = useMemo(() => {
+    if (!selected?.bankAccountCode) return null;
+
+    return layouts.find(
+      (layout) =>
+        layout.bankAccountCode === selected.bankAccountCode &&
+        layout.isActive
+    );
+  }, [layouts, selected]);
 
   const filteredVouchers = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -77,8 +111,26 @@ export default function VouchersPage() {
     }
   }
 
+  async function loadLayouts() {
+    try {
+      const response = await fetch("/api/cw/layouts", {
+        cache: "no-store",
+      });
+
+      const payload = await response.json();
+
+      if (payload?.success && Array.isArray(payload.data)) {
+        setLayouts(payload.data);
+      }
+    } catch (error) {
+      console.error("Failed to load layouts", error);
+    }
+  }
+
+
   useEffect(() => {
     void load();
+    void loadLayouts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -203,13 +255,76 @@ export default function VouchersPage() {
                 <button className="btn secondary" onClick={() => setSelected(null)}>Close</button>
               </div>
             </div>
-            <div className="cheque-preview">
-              <div className="cheque-field" style={{ left: 540, top: 56 }}>{selected.chequeDate}</div>
-              <div className="cheque-field" style={{ left: 112, top: 118 }}>{selected.payeeName}</div>
-              <div className="cheque-field" style={{ left: 588, top: 182 }}>{formatMoney(selected.amount, selected.currencyCode)}</div>
-              <div className="cheque-field" style={{ left: 120, top: 212, maxWidth: 470, whiteSpace: "normal" }}>{amountToWords(selected.amount)}</div>
-              <div className="cheque-field" style={{ left: 84, top: 74 }}>A/C PAYEE ONLY</div>
+
+            <div
+              className="cheque-preview"
+              style={{
+                width: selectedLayout
+                  ? `${selectedLayout.pageWidthMm}mm`
+                  : "180mm",
+
+                height: selectedLayout
+                  ? `${selectedLayout.pageHeightMm}mm`
+                  : "90mm",
+
+                position: "relative",
+              }}
+            >
+
+              <div
+                className="cheque-field"
+                style={{
+                  left: `${selectedLayout?.dateX || 135}mm`,
+                  top: `${selectedLayout?.dateY || 14}mm`,
+                }}
+              >
+                {new Date(selected.chequeDate).toLocaleDateString("en-GB")}
+              </div>
+
+              <div
+                className="cheque-field"
+                style={{
+                  left: `${selectedLayout?.payeeX || 28}mm`,
+                  top: `${selectedLayout?.payeeY || 30}mm`,
+                }}
+              >
+                {selected.payeeName}
+              </div>
+
+              <div
+                className="cheque-field"
+                style={{
+                  left: `${selectedLayout?.amountNumberX || 145}mm`,
+                  top: `${selectedLayout?.amountNumberY || 45}mm`,
+                }}
+              >
+                {formatMoney(selected.amount, selected.currencyCode)}
+              </div>
+
+              <div
+                className="cheque-field"
+                style={{
+                  left: `${selectedLayout?.amountWordsX || 30}mm`,
+                  top: `${selectedLayout?.amountWordsY || 53}mm`,
+                  maxWidth: "110mm",
+                  whiteSpace: "normal",
+                }}
+              >
+                {amountToWords(selected.amount)}
+              </div>
+
+              <div
+                className="cheque-field"
+                style={{
+                  left: `${selectedLayout?.accountPayeeX || 22}mm`,
+                  top: `${selectedLayout?.accountPayeeY || 18}mm`,
+                }}
+              >
+                A/C PAYEE ONLY
+              </div>
+
             </div>
+
             <p className="muted no-print">Layout coordinates are sample values. Adjust them in Bank Layout Setup per bank.</p>
           </div>
         ) : null}

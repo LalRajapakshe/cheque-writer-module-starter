@@ -7,3 +7,5 @@ obj/
 .vs/
 *.user
 *.suo
+*.rar
+publish

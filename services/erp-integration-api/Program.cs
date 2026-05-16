@@ -13,7 +13,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy => policy
-        .WithOrigins("http://localhost:3000")
+        .AllowAnyOrigin() //.WithOrigins("http://localhost:3000") 
         .AllowAnyHeader()
         .AllowAnyMethod());
 });
@@ -177,6 +177,77 @@ secured.MapPost("/print-confirmations", async (ClaimsPrincipal user, PrintConfir
     try
     {
         var result = await service.ConfirmPrintAsync(user, request);
+        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+    }
+    catch (Exception ex)
+    {
+        return ServerError(ex);
+    }
+});
+
+secured.MapGet("/print-register", async (
+    ClaimsPrincipal user,
+    ChequeWriterService service,
+    DateTime? fromDate,
+    DateTime? toDate,
+    string? bankAccountCode,
+    string? status,
+    string? search,
+    int? maxRows) =>
+{
+    try
+    {
+        var rows = await service.GetPrintRegisterAsync(user, fromDate, toDate, bankAccountCode, status, search, maxRows);
+        return Results.Ok(new { success = true, data = rows });
+    }
+    catch (Exception ex)
+    {
+        return ServerError(ex);
+    }
+});
+
+secured.MapGet("/print-register/{chequePrintId:int}/audit", async (
+    int chequePrintId,
+    ClaimsPrincipal user,
+    ChequeWriterService service) =>
+{
+    try
+    {
+        var rows = await service.GetPrintAuditAsync(user, chequePrintId);
+        return Results.Ok(new { success = true, data = rows });
+    }
+    catch (Exception ex)
+    {
+        return ServerError(ex);
+    }
+});
+
+secured.MapPost("/print-register/{chequePrintId:int}/reprint", async (
+    int chequePrintId,
+    ClaimsPrincipal user,
+    PrintRegisterActionRequest request,
+    ChequeWriterService service) =>
+{
+    try
+    {
+        var result = await service.ReprintChequeAsync(user, chequePrintId, request);
+        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+    }
+    catch (Exception ex)
+    {
+        return ServerError(ex);
+    }
+});
+
+secured.MapPost("/print-register/{chequePrintId:int}/void", async (
+    int chequePrintId,
+    ClaimsPrincipal user,
+    PrintRegisterActionRequest request,
+    ChequeWriterService service) =>
+{
+    try
+    {
+        var result = await service.VoidChequeAsync(user, chequePrintId, request);
         return result.Success ? Results.Ok(result) : Results.BadRequest(result);
     }
     catch (Exception ex)
@@ -695,7 +766,8 @@ public async Task<ApiResult> UpdateChequeBookAsync(
 
             var existingCount = await db.ExecuteScalarAsync<int>(@"
                 SELECT COUNT(1) FROM cw.ChequePrintRegister
-                WHERE VoucherNo = @VoucherNo OR (BankAccountCode = @BankAccountCode AND ChequeNo = @ChequeNo)",
+                WHERE (VoucherNo = @VoucherNo AND ISNULL(PrintStatus, N'') <> N'VOIDED')
+                   OR (BankAccountCode = @BankAccountCode AND ChequeNo = @ChequeNo)",
                 new { voucher.VoucherNo, voucher.BankAccountCode, voucher.ChequeNo }, tx, commandTimeout: 120);
 
             if (existingCount > 0) { tx.Rollback(); return ApiResult.Fail("Voucher or cheque number has already been printed/registered."); }
@@ -716,6 +788,241 @@ public async Task<ApiResult> UpdateChequeBookAsync(
 
             tx.Commit();
             return ApiResult.Ok(new { chequePrintId = printId, status = "PRINTED" });
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+    }
+
+    public async Task<IReadOnlyList<PrintRegisterDto>> GetPrintRegisterAsync(
+        ClaimsPrincipal user,
+        DateTime? fromDate,
+        DateTime? toDate,
+        string? bankAccountCode,
+        string? status,
+        string? search,
+        int? maxRows)
+    {
+        if (configuration.GetValue<bool>("ChequeWriter:DemoMode")) return [PrintRegisterDto.Demo()];
+
+        var effectiveMaxRows = Math.Clamp(maxRows ?? 200, 1, 2000);
+        var effectiveStatus = EmptyToNull(status)?.ToUpperInvariant();
+        if (effectiveStatus is "ALL") effectiveStatus = null;
+
+        using var db = dbFactory.Create();
+        var rows = await db.QueryAsync<PrintRegisterDto>(@"
+            SELECT TOP (@MaxRows)
+                ChequePrintId,
+                VoucherNo,
+                VoucherDate,
+                CompanyCode,
+                BranchCode,
+                BankAccountCode,
+                BankAccountName,
+                ChequeNo,
+                ChequeDate,
+                PayeeName,
+                Amount,
+                AmountInWords,
+                ChequeBookId,
+                LayoutId,
+                PrintStatus,
+                ISNULL(PrintCount, 1) AS PrintCount,
+                ISNULL(ReprintCount, CASE WHEN ISNULL(PrintCount, 1) > 1 THEN ISNULL(PrintCount, 1) - 1 ELSE 0 END) AS ReprintCount,
+                PrintedBy,
+                PrintedDate,
+                LastReprintedBy,
+                LastReprintedDate,
+                LastReprintReason,
+                VoidedBy,
+                VoidedDate,
+                VoidReason,
+                CreatedBy
+            FROM cw.ChequePrintRegister
+            WHERE (@FromDate IS NULL OR CAST(PrintedDate AS date) >= CAST(@FromDate AS date))
+              AND (@ToDate IS NULL OR CAST(PrintedDate AS date) <= CAST(@ToDate AS date))
+              AND (@BankAccountCode IS NULL OR BankAccountCode = @BankAccountCode)
+              AND (
+                    @Status IS NULL
+                 OR (@Status = N'REPRINTED' AND ISNULL(ReprintCount, 0) > 0)
+                 OR (@Status <> N'REPRINTED' AND PrintStatus = @Status)
+              )
+              AND (
+                    @Search IS NULL
+                 OR VoucherNo LIKE N'%' + @Search + N'%'
+                 OR ChequeNo LIKE N'%' + @Search + N'%'
+                 OR PayeeName LIKE N'%' + @Search + N'%'
+                 OR BankAccountCode LIKE N'%' + @Search + N'%'
+              )
+            ORDER BY PrintedDate DESC, ChequePrintId DESC;",
+            new
+            {
+                MaxRows = effectiveMaxRows,
+                FromDate = fromDate,
+                ToDate = toDate,
+                BankAccountCode = EmptyToNull(bankAccountCode),
+                Status = effectiveStatus,
+                Search = EmptyToNull(search)
+            },
+            commandTimeout: 120);
+
+        return rows.ToList();
+    }
+
+    public async Task<IReadOnlyList<PrintAuditDto>> GetPrintAuditAsync(ClaimsPrincipal user, int chequePrintId)
+    {
+        if (configuration.GetValue<bool>("ChequeWriter:DemoMode")) return [PrintAuditDto.Demo(chequePrintId)];
+
+        using var db = dbFactory.Create();
+        var rows = await db.QueryAsync<PrintAuditDto>(@"
+            SELECT
+                AuditLogId,
+                ChequePrintId,
+                VoucherNo,
+                BankAccountCode,
+                ChequeNo,
+                ActionName,
+                OldStatus,
+                NewStatus,
+                ActionBy,
+                ActionDate,
+                Reason,
+                Remarks
+            FROM cw.ChequePrintAuditLog
+            WHERE ChequePrintId = @ChequePrintId
+            ORDER BY ActionDate DESC, AuditLogId DESC;",
+            new { ChequePrintId = chequePrintId },
+            commandTimeout: 120);
+
+        return rows.ToList();
+    }
+
+    public async Task<ApiResult> ReprintChequeAsync(ClaimsPrincipal user, int chequePrintId, PrintRegisterActionRequest request)
+    {
+        if (!HasPermission(user, "CHEQUE_WRITER.REPRINT")) return ApiResult.Fail("No permission to reprint cheques.");
+        if (chequePrintId <= 0) return ApiResult.Fail("Invalid cheque print id.");
+        if (string.IsNullOrWhiteSpace(request.Reason)) return ApiResult.Fail("Reprint reason is required.");
+        if (configuration.GetValue<bool>("ChequeWriter:DemoMode")) return ApiResult.Ok(new { chequePrintId, action = "REPRINT" });
+
+        using var db = dbFactory.Create();
+        db.Open();
+        using var tx = db.BeginTransaction();
+        try
+        {
+            var row = await db.QueryFirstOrDefaultAsync<PrintRegisterDto>(@"
+                SELECT TOP 1 ChequePrintId, VoucherNo, BankAccountCode, ChequeNo, PrintStatus
+                FROM cw.ChequePrintRegister
+                WHERE ChequePrintId = @ChequePrintId;",
+                new { ChequePrintId = chequePrintId }, tx, commandTimeout: 120);
+
+            if (row is null) { tx.Rollback(); return ApiResult.Fail("Printed cheque was not found."); }
+            var oldStatus = string.IsNullOrWhiteSpace(row.PrintStatus) ? "PRINTED" : row.PrintStatus!;
+            if (string.Equals(oldStatus, "VOIDED", StringComparison.OrdinalIgnoreCase))
+            {
+                tx.Rollback();
+                return ApiResult.Fail("Voided cheques cannot be reprinted.");
+            }
+
+            var userName = user.Identity?.Name ?? "system";
+            await db.ExecuteAsync(@"
+                UPDATE cw.ChequePrintRegister
+                SET
+                    PrintCount = ISNULL(PrintCount, 1) + 1,
+                    ReprintCount = ISNULL(ReprintCount, 0) + 1,
+                    LastReprintedBy = @UserName,
+                    LastReprintedDate = SYSDATETIME(),
+                    LastReprintReason = @Reason,
+                    UpdatedBy = @UserName,
+                    UpdatedDate = SYSDATETIME()
+                WHERE ChequePrintId = @ChequePrintId
+                  AND ISNULL(PrintStatus, N'') <> N'VOIDED';",
+                new { ChequePrintId = chequePrintId, UserName = userName, Reason = request.Reason.Trim() }, tx, commandTimeout: 120);
+
+            await db.ExecuteAsync(@"
+                INSERT INTO cw.ChequePrintAuditLog
+                    (ChequePrintId, VoucherNo, BankAccountCode, ChequeNo, ActionName, OldStatus, NewStatus, ActionBy, ActionDate, Reason, Remarks)
+                VALUES
+                    (@ChequePrintId, @VoucherNo, @BankAccountCode, @ChequeNo, N'REPRINT', @OldStatus, @OldStatus, @ActionBy, SYSDATETIME(), @Reason, N'Cheque reprint confirmed by user.');",
+                new
+                {
+                    ChequePrintId = chequePrintId,
+                    row.VoucherNo,
+                    row.BankAccountCode,
+                    row.ChequeNo,
+                    OldStatus = oldStatus,
+                    ActionBy = userName,
+                    Reason = request.Reason.Trim()
+                }, tx, commandTimeout: 120);
+
+            tx.Commit();
+            return ApiResult.Ok(new { chequePrintId, action = "REPRINT" });
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+    }
+
+    public async Task<ApiResult> VoidChequeAsync(ClaimsPrincipal user, int chequePrintId, PrintRegisterActionRequest request)
+    {
+        if (!HasPermission(user, "CHEQUE_WRITER.VOID")) return ApiResult.Fail("No permission to void cheques.");
+        if (chequePrintId <= 0) return ApiResult.Fail("Invalid cheque print id.");
+        if (string.IsNullOrWhiteSpace(request.Reason)) return ApiResult.Fail("Void reason is required.");
+        if (configuration.GetValue<bool>("ChequeWriter:DemoMode")) return ApiResult.Ok(new { chequePrintId, status = "VOIDED" });
+
+        using var db = dbFactory.Create();
+        db.Open();
+        using var tx = db.BeginTransaction();
+        try
+        {
+            var row = await db.QueryFirstOrDefaultAsync<PrintRegisterDto>(@"
+                SELECT TOP 1 ChequePrintId, VoucherNo, BankAccountCode, ChequeNo, PrintStatus
+                FROM cw.ChequePrintRegister
+                WHERE ChequePrintId = @ChequePrintId;",
+                new { ChequePrintId = chequePrintId }, tx, commandTimeout: 120);
+
+            if (row is null) { tx.Rollback(); return ApiResult.Fail("Printed cheque was not found."); }
+            var oldStatus = string.IsNullOrWhiteSpace(row.PrintStatus) ? "PRINTED" : row.PrintStatus!;
+            if (string.Equals(oldStatus, "VOIDED", StringComparison.OrdinalIgnoreCase))
+            {
+                tx.Rollback();
+                return ApiResult.Fail("Cheque is already voided.");
+            }
+
+            var userName = user.Identity?.Name ?? "system";
+            await db.ExecuteAsync(@"
+                UPDATE cw.ChequePrintRegister
+                SET
+                    PrintStatus = N'VOIDED',
+                    VoidedBy = @UserName,
+                    VoidedDate = SYSDATETIME(),
+                    VoidReason = @Reason,
+                    UpdatedBy = @UserName,
+                    UpdatedDate = SYSDATETIME()
+                WHERE ChequePrintId = @ChequePrintId;",
+                new { ChequePrintId = chequePrintId, UserName = userName, Reason = request.Reason.Trim() }, tx, commandTimeout: 120);
+
+            await db.ExecuteAsync(@"
+                INSERT INTO cw.ChequePrintAuditLog
+                    (ChequePrintId, VoucherNo, BankAccountCode, ChequeNo, ActionName, OldStatus, NewStatus, ActionBy, ActionDate, Reason, Remarks)
+                VALUES
+                    (@ChequePrintId, @VoucherNo, @BankAccountCode, @ChequeNo, N'VOID', @OldStatus, N'VOIDED', @ActionBy, SYSDATETIME(), @Reason, N'Cheque voided by user.');",
+                new
+                {
+                    ChequePrintId = chequePrintId,
+                    row.VoucherNo,
+                    row.BankAccountCode,
+                    row.ChequeNo,
+                    OldStatus = oldStatus,
+                    ActionBy = userName,
+                    Reason = request.Reason.Trim()
+                }, tx, commandTimeout: 120);
+
+            tx.Commit();
+            return ApiResult.Ok(new { chequePrintId, status = "VOIDED" });
         }
         catch
         {
@@ -864,18 +1171,6 @@ private async Task<Dictionary<string, BankAccountSetupStatusDto>> GetBankAccount
 
                     statusMap = await GetVoucherQueueSetupStatusAsync(db, rows);
                 }
-            // Safety refresh if voucher list contains bank accounts that are still not in master.
-            if (hasMissingBankMaster)
-            {
-                await db.ExecuteAsync(
-                    "cw.usp_CW_RefreshBankAccountMaster",
-                    new { RunBy = user.Identity?.Name ?? "system" },
-                    commandType: CommandType.StoredProcedure,
-                    commandTimeout: 180);
-
-                statusMap = await GetBankAccountSetupStatusAsync(db, rows.Select(x => x.BankAccountCode));
-            }
-
      /*       foreach (var row in rows)
             {
                 if (statusMap.TryGetValue(row.BankAccountCode, out var status))
@@ -1101,6 +1396,91 @@ public sealed record ChequeLayoutUpsertRequest(string BankAccountCode, string La
 }
 
 public sealed record PrintConfirmationRequest(string VoucherNo, bool PrintedSuccessfully, string? AmountInWords);
+
+public sealed record PrintRegisterActionRequest(string Reason);
+
+public sealed class PrintRegisterDto
+{
+    public int ChequePrintId { get; set; }
+    public string VoucherNo { get; set; } = "";
+    public DateTime? VoucherDate { get; set; }
+    public string? CompanyCode { get; set; }
+    public string? BranchCode { get; set; }
+    public string BankAccountCode { get; set; } = "";
+    public string? BankAccountName { get; set; }
+    public string ChequeNo { get; set; } = "";
+    public DateTime? ChequeDate { get; set; }
+    public string PayeeName { get; set; } = "";
+    public decimal Amount { get; set; }
+    public string? AmountInWords { get; set; }
+    public int? ChequeBookId { get; set; }
+    public int? LayoutId { get; set; }
+    public string? PrintStatus { get; set; } = "PRINTED";
+    public int PrintCount { get; set; } = 1;
+    public int ReprintCount { get; set; }
+    public string? PrintedBy { get; set; }
+    public DateTime? PrintedDate { get; set; }
+    public string? LastReprintedBy { get; set; }
+    public DateTime? LastReprintedDate { get; set; }
+    public string? LastReprintReason { get; set; }
+    public string? VoidedBy { get; set; }
+    public DateTime? VoidedDate { get; set; }
+    public string? VoidReason { get; set; }
+    public string? CreatedBy { get; set; }
+
+    public static PrintRegisterDto Demo() => new()
+    {
+        ChequePrintId = 1,
+        VoucherNo = "PV-000001",
+        VoucherDate = DateTime.Today,
+        CompanyCode = "DEMO",
+        BranchCode = "MAIN",
+        BankAccountCode = "BOC-CURRENT-001",
+        BankAccountName = "BOC Current Account",
+        ChequeNo = "000123",
+        ChequeDate = DateTime.Today,
+        PayeeName = "ABC Suppliers (Pvt) Ltd",
+        Amount = 125000m,
+        AmountInWords = "One Hundred Twenty Five Thousand Only",
+        ChequeBookId = 1,
+        LayoutId = 1,
+        PrintStatus = "PRINTED",
+        PrintCount = 1,
+        ReprintCount = 0,
+        PrintedBy = "demo",
+        PrintedDate = DateTime.Now
+    };
+}
+
+public sealed class PrintAuditDto
+{
+    public long AuditLogId { get; set; }
+    public int? ChequePrintId { get; set; }
+    public string? VoucherNo { get; set; }
+    public string? BankAccountCode { get; set; }
+    public string? ChequeNo { get; set; }
+    public string ActionName { get; set; } = "";
+    public string? OldStatus { get; set; }
+    public string? NewStatus { get; set; }
+    public string? ActionBy { get; set; }
+    public DateTime? ActionDate { get; set; }
+    public string? Reason { get; set; }
+    public string? Remarks { get; set; }
+
+    public static PrintAuditDto Demo(int chequePrintId) => new()
+    {
+        AuditLogId = 1,
+        ChequePrintId = chequePrintId,
+        VoucherNo = "PV-000001",
+        BankAccountCode = "BOC-CURRENT-001",
+        ChequeNo = "000123",
+        ActionName = "PRINT_CONFIRM",
+        NewStatus = "PRINTED",
+        ActionBy = "demo",
+        ActionDate = DateTime.Now,
+        Remarks = "Cheque print confirmed by user."
+    };
+}
 
 public sealed record ApiResult(bool Success, object? Data, string? Error)
 {

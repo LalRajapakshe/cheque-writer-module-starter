@@ -15,13 +15,22 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: false, error: payload.error || "Login failed" }, { status: 401 });
     }
     const next = NextResponse.json({ success: true, data: payload.data.user });
-    next.cookies.set("cw_session", payload.data.token, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      path: "/",
-      maxAge: 60 * 60 * 8,
-    });
+    // 🔥 IMPORTANT PART
+    // const host = request.headers.get("host");
+
+    //   next.cookies.set("cw_session", payload.data.token, {
+    //     httpOnly: true,
+    //     sameSite: "lax",
+    //     secure: process.env.NODE_ENV === "production",
+    //     path: "/",
+    //     maxAge: 60 * 60 * 8,
+    //domain: "124.43.177.143", // 🔥 ADD THIS
+    // domain: host || undefined, // 🔥 dynamic domain fix
+    //   });
+    next.headers.append(
+      "Set-Cookie",
+      `cw_session=${payload.data.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 8}`
+    );
     return next;
   } catch (error) {
     console.error("Login failed", error);
